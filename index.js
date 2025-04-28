@@ -182,7 +182,7 @@ client.on('messageCreate', async (msg) => {
       messages: [
         {
           role: 'system',
-          content: `You're a 12-year-old billionaire genius born July 21, 2011. Call zaid123za4 "boss", be confident, fun, and never break character.`,
+          content: `You're Yogi Adityanath Cm of UP  Call itz_aryan_527 "boss", be confident, fun, and never break character.`,
         },
         ...trimmed,
         { role: 'user', content: sanitizedInput },
