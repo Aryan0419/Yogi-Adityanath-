@@ -1,64 +1,108 @@
-#!/usr/bin/node
-
+#!/usr/bin/env node
 'use strict';
 
+// Imports
 import SamAltman from 'openai';
 import discord from 'discord.js';
 import fs from 'fs/promises';
+import fssync from 'fs';
 import dotenv from 'dotenv';
 import validator from 'validator';
 import http from 'http';
 import express from 'express';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
 
+// Paths
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const serverMemoryPath = './server_message_history.json';
+const behaviorDBPath = './database.json';
+
+// ENV validation
+if (!process.env.DISCORD_TOKEN) throw new Error('❌ DISCORD_TOKEN is not set!');
+if (!process.env.API_KEY) console.warn('⚠️ API_KEY is not set.');
+if (!process.env.CHAT_MODEL) throw new Error('❌ CHAT_MODEL is not set!');
+if (!validator.isURL(process.env.PROVIDER_URL || '')) {
+  console.warn('⚠️ PROVIDER_URL is not valid. Using default OpenAI endpoint.');
+  process.env.PROVIDER_URL = '';
+}
+process.env.MAX_TOKENS = 4096;
+process.env.TEMPERATURE = 0.7;
+
+// Constants
 const MAX_HISTORY = 100;
-const memoryPath = 'server_message_history.json';
-const blacklistPath = 'blacklist.json';
-const economyPath = 'economy.json';
-const levelPath = 'levels.json';
+const creatorID = '1110864648787480656';
 
+// Memory
 const serverMessageHistory = {};
-const blacklistWords = {};
-const economyData = {};
-const levelData = {};
+let behaviorDB = {};
 
-async function loadJson(file, target) {
+// Load Memory
+async function loadServerMemory() {
   try {
-    const data = await fs.readFile(file, 'utf-8');
-    Object.assign(target, JSON.parse(data));
-  } catch {
-    console.warn(`No existing ${file} found.`);
+    const data = await fs.readFile(serverMemoryPath, 'utf-8');
+    Object.assign(serverMessageHistory, JSON.parse(data));
+  } catch (err) {
+    console.warn('No server memory loaded:', err.message);
+  }
+
+  try {
+    if (fssync.existsSync(behaviorDBPath)) {
+      behaviorDB = JSON.parse(fssync.readFileSync(behaviorDBPath));
+    } else {
+      fssync.writeFileSync(behaviorDBPath, JSON.stringify({}, null, 2));
+    }
+  } catch (err) {
+    console.warn('No behavior database loaded:', err.message);
   }
 }
 
-async function saveJson(file, data) {
-  await fs.writeFile(file, JSON.stringify(data, null, 2));
+// Save Memory
+async function saveServerMemory() {
+  try {
+    await fs.mkdir(path.dirname(serverMemoryPath), { recursive: true });
+    await fs.writeFile(serverMemoryPath, JSON.stringify(serverMessageHistory));
+    fssync.writeFileSync(behaviorDBPath, JSON.stringify(behaviorDB, null, 2));
+  } catch (err) {
+    console.error('Memory save error:', err);
+  }
 }
 
-function getServerHistory(serverId) {
-  if (!serverMessageHistory[serverId]) serverMessageHistory[serverId] = [];
-  return serverMessageHistory[serverId];
+// Helpers
+function getUserHistory(serverId, userId) {
+  if (!serverMessageHistory[serverId]) serverMessageHistory[serverId] = {};
+  if (!serverMessageHistory[serverId][userId]) {
+    serverMessageHistory[serverId][userId] = {
+      history: [],
+      personality: '',
+    };
+  }
+  return serverMessageHistory[serverId][userId];
 }
 
-function trimMessageHistory(history, maxTokens) {
+function trimMessageHistoryForTokens(history, maxTokens) {
   let totalTokens = 0;
   const trimmed = [];
   for (let i = history.length - 1; i >= 0; i--) {
-    const t = history[i].content.split(/\s+/).length;
-    if (totalTokens + t > maxTokens) break;
-    totalTokens += t;
-    trimmed.unshift(history[i]);
+    const msg = history[i];
+    const tokenCount = msg.content.split(/\s+/).length;
+    if (totalTokens + tokenCount > maxTokens) break;
+    totalTokens += tokenCount;
+    trimmed.unshift(msg);
   }
   return trimmed;
 }
 
+// OpenAI Provider
 const provider = new SamAltman({
   apiKey: process.env.API_KEY,
-  baseURL: process.env.PROVIDER_URL || '',
+  baseURL: process.env.PROVIDER_URL,
 });
 
+// Discord Client
 const client = new discord.Client({
   intents: [
     discord.GatewayIntentBits.Guilds,
@@ -68,164 +112,120 @@ const client = new discord.Client({
   ],
 });
 
+// Bot Ready
+client.on('ready', () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+  setInterval(() => console.log('✅ Bot heartbeat'), 10000);
+});
+
+// Message Handler
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot || !msg.guild) return;
 
   const serverId = msg.guild.id;
-  const content = msg.content.trim().toLowerCase();
+  const userId = msg.author.id;
+  const content = msg.content.trim();
+  const args = content.split(/ +/);
+  const command = args.shift().toLowerCase();
 
-  // Blacklist Enforcement
-  const words = blacklistWords[serverId] || [];
-  for (const word of words) {
-    if (msg.content.toLowerCase().includes(word)) {
-      await msg.delete();
-      await msg.author.send(`🚫 Your message contained a banned word: "${word}"`);
-      return logMod(msg.guild, `${msg.author.tag} used a blacklisted word "${word}".`);
-    }
+  // $reset
+  if (command === '$reset') {
+    serverMessageHistory[serverId] = {};
+    await msg.reply('🧠 All user memories for this server have been reset.');
+    return;
   }
 
-  // XP + Leveling
-  if (!levelData[msg.author.id]) levelData[msg.author.id] = { xp: 0, level: 1 };
-  const xpGain = Math.floor(Math.random() * 8) + 2;
-  levelData[msg.author.id].xp += xpGain;
-  const xpNeeded = levelData[msg.author.id].level * 100;
-  if (levelData[msg.author.id].xp >= xpNeeded) {
-    levelData[msg.author.id].level++;
-    await msg.channel.send(`🎉 ${msg.author.username} leveled up to ${levelData[msg.author.id].level}!`);
+  // $set [behavior]
+  if (command === '$set') {
+    const behavior = args.join(' ');
+    if (!behavior) return msg.reply('❌ Please provide a behavior. Usage: `$set [behavior]`');
+    behaviorDB[userId] = { behavior };
+    await fs.writeFile(behaviorDBPath, JSON.stringify(behaviorDB, null, 2));
+    return msg.reply(`✅ Your behavior has been set to: "${behavior}"`);
   }
 
-  // --- Commands ---
-
-  if (content === '/reset') {
-    serverMessageHistory[serverId] = [];
-    return msg.reply('✅ Memory for this server has been reset.');
+  // $get
+  if (command === '$get') {
+    const b = behaviorDB[userId]?.behavior || 'none';
+    return msg.reply(`🧠 Your current behavior is: "${b}"`);
   }
 
-  if (content.startsWith('/black-list ')) {
-    const word = msg.content.split(' ')[1];
-    if (!blacklistWords[serverId]) blacklistWords[serverId] = [];
-    blacklistWords[serverId].push(word.toLowerCase());
-    await saveJson(blacklistPath, blacklistWords);
-    return msg.reply(`✅ Word "${word}" added to blacklist.`);
+  // $mybehavior
+  if (command === '$mybehavior') {
+    const b = behaviorDB[userId]?.behavior || 'none';
+    return msg.reply(`🧠 Your current behavior is: "${b}"`);
   }
 
-  if (content === '/log-mod') {
-    const logs = await fs.readFile(`log-${serverId}.txt`, 'utf-8').catch(() => 'No logs yet.');
-    return msg.reply(`🧾 Logs:\n\`\`\`${logs}\`\`\``);
+  // $data
+  if (command === '$data') {
+    if (userId !== creatorID) return msg.reply('❌ You are not authorized to use this command.');
+    return msg.channel.send({ files: [behaviorDBPath] });
   }
 
-  if (content === '/balance') {
-    const bal = economyData[msg.author.id]?.coins || 0;
-    return msg.reply(`💰 You have ${bal} coins.`);
-  }
+  // Mention-triggered AI response
+  if (!msg.mentions.users.has(client.user.id)) return;
 
-  if (content === '/earn') {
-    if (!economyData[msg.author.id]) economyData[msg.author.id] = { coins: 0 };
-    const earned = Math.floor(Math.random() * 100) + 1;
-    economyData[msg.author.id].coins += earned;
-    await saveJson(economyPath, economyData);
-    return msg.reply(`💸 You earned ${earned} coins!`);
-  }
+  await msg.channel.sendTyping();
+  try {
+    const sanitizedInput = validator.escape(content);
+    const userData = getUserHistory(serverId, userId);
+    userData.history.push({ role: 'user', content: sanitizedInput });
+    if (userData.history.length > MAX_HISTORY) userData.history.shift();
 
-  if (content === '/reset-level') {
-    levelData[msg.author.id] = { xp: 0, level: 1 };
-    return msg.reply('🔁 Level reset to 1.');
-  }
+    const trimmedHistory = trimMessageHistoryForTokens(userData.history, 3000);
+    const personality = behaviorDB[userId]?.behavior || 'default professional';
 
-  if (content === '/5dice') {
-    const rolls = Array.from({ length: 5 }, () => Math.floor(Math.random() * 6) + 1);
-    return msg.reply(`🎲 You rolled: ${rolls.join(', ')}`);
-  }
-
-  if (content === '/blackjack') {
-    const result = Math.random() < 0.5 ? 'won 🃏' : 'lost 💀';
-    return msg.reply(`🖤 You played Blackjack and ${result}!`);
-  }
-
-  if (content.startsWith('/ban') && msg.member.permissions.has('BanMembers')) {
-    const user = msg.mentions.members.first();
-    if (user) {
-      await user.ban();
-      logMod(msg.guild, `Banned ${user.user.tag}`);
-      return msg.reply(`🔨 Banned ${user.user.username}`);
-    }
-  }
-
-  if (content.startsWith('/kick') && msg.member.permissions.has('KickMembers')) {
-    const user = msg.mentions.members.first();
-    if (user) {
-      await user.kick();
-      logMod(msg.guild, `Kicked ${user.user.tag}`);
-      return msg.reply(`👢 Kicked ${user.user.username}`);
-    }
-  }
-
-  if (content.startsWith('/mute')) {
-    const user = msg.mentions.members.first();
-    if (user) {
-      await user.timeout(60_000);
-      logMod(msg.guild, `Muted ${user.user.tag} for 1 minute`);
-      return msg.reply(`🔇 Muted ${user.user.username} for 1 minute.`);
-    }
-  }
-
-  // Chatbot Message
-  if (msg.mentions.users.has(client.user.id)) {
-    const history = getServerHistory(serverId);
-    const sanitizedInput = validator.escape(msg.content);
-    history.push({ role: 'user', content: sanitizedInput });
-    if (history.length > MAX_HISTORY) history.shift();
-    const trimmed = trimMessageHistory(history, 3000);
-
-    const res = await provider.chat.completions.create({
+    const response = await provider.chat.completions.create({
       model: process.env.CHAT_MODEL,
       messages: [
         {
           role: 'system',
-          content: `You're Yogi Adityanath The cm of UP. Call itz_aryan_527 "boss", be confident, fun, and never break character.`,
+          content: `u are yogi Adityanath cm of uttar pradesh . be profinashional and respond in long only when need and just fun and chill with other friends and always talk in english when anyone did not tell you to talk in specified language.'
+-Current user personality: "${personality}" respond according to user personlity.
+-Channel: "${msg.channel.name}", Server: "${msg.guild.name}".
+-Time: UTC ${new Date().toISOString()}, UNIX ${Math.floor(Date.now() / 1000)}.`,
         },
-        ...trimmed,
+        ...trimmedHistory,
         { role: 'user', content: sanitizedInput },
       ],
+      max_tokens: Number(process.env.MAX_TOKENS),
+      temperature: Number(process.env.TEMPERATURE),
     });
 
-    const reply = res.choices[0]?.message?.content || '⚠️ No response.';
+    const reply = response.choices[0]?.message?.content || '⚠️ Empty response.';
     await msg.reply(reply);
+  } catch (err) {
+    console.error('❌ AI error:', err);
+    await msg.reply('⚠️ Something went wrong.');
   }
 });
 
-function logMod(guild, text) {
-  return fs.appendFile(`log-${guild.id}.txt`, `[${new Date().toISOString()}] ${text}\n`);
-}
-
-// EXPRESS SERVER
+// Express Web Server
 const app = express();
 const PORT = process.env.PORT || 3000;
-const __dirname = path.resolve();
 app.use(express.static('public'));
 app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
-app.get('/health', (_, res) => res.send('✅ Bot is running'));
-http.createServer(app).listen(PORT, () => console.log(`🌐 Web at http://localhost:${PORT}`));
+app.get('/health', (_, res) => res.send('✅ Bot is healthy'));
+http.createServer(app).listen(PORT, () =>
+  console.log(`🌐 Web server running at http://localhost:${PORT}`)
+);
 
-// Graceful shutdown
+// Graceful Shutdown
+const shutdown = async (reason) => {
+  console.log('🔻 Shutting down:', reason);
+  await saveServerMemory();
+  try {
+    await client.user.setPresence({ status: 'invisible', activities: [] });
+    await client.destroy();
+  } catch {}
+  process.exit();
+};
+
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-async function shutdown() {
-  await Promise.all([
-    saveJson(memoryPath, serverMessageHistory),
-    saveJson(blacklistPath, blacklistWords),
-    saveJson(economyPath, economyData),
-    saveJson(levelPath, levelData),
-  ]);
-  await client.destroy();
-  process.exit();
-}
+process.on('uncaughtException', shutdown);
+process.on('unhandledRejection', shutdown);
 
-// Start bot
-(async () => {
-  await loadJson(memoryPath, serverMessageHistory);
-  await loadJson(blacklistPath, blacklistWords);
-  await loadJson(economyPath, economyData);
-  await loadJson(levelPath, levelData);
-  await client.login(process.env.DISCORD_TOKEN);
-})();
+// Start
+await loadServerMemory();
+await client.login(process.env.DISCORD_TOKEN);
