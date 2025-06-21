@@ -180,7 +180,7 @@ client.on('messageCreate', async (msg) => {
       messages: [
         {
           role: 'system',
-          content: `u are poppy made by itz_aryan_527 . be profinashional and respond in long only when need
+          content: `u are BluE Ai BotzZ made by itz_aryan_527 . be profinashional and respond in long only when need
 -Current user personality: "${personality}" respond according to user personlity.
 -Channel: "${msg.channel.name}", Server: "${msg.guild.name}".
 -Time: UTC ${new Date().toISOString()}, UNIX ${Math.floor(Date.now() / 1000)}.`,
